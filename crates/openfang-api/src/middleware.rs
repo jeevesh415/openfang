@@ -167,13 +167,14 @@ pub async fn auth(
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
     // cannot set custom headers, same approach as WebSocket auth).
-    let query_token = request
+    let query_token_decoded = request
         .uri()
         .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .map(crate::percent_decode);
 
     // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
+    let query_auth = query_token_decoded.as_deref().map(|token| {
         use subtle::ConstantTimeEq;
         if token.len() != api_key.len() {
             return false;
@@ -236,13 +237,16 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
-    // All JS/CSS is bundled inline — only external resource is Google Fonts.
-    headers.insert(
-        "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
-    );
+    // The dashboard handler (webchat_page) sets its own nonce-based CSP.
+    // For all other responses (API endpoints), apply a strict default.
+    if !headers.contains_key("content-security-policy") {
+        headers.insert(
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'"
+                .parse()
+                .unwrap(),
+        );
+    }
     headers.insert(
         "referrer-policy",
         "strict-origin-when-cross-origin".parse().unwrap(),

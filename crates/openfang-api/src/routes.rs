@@ -1,11 +1,12 @@
 //! Route handlers for the OpenFang API.
 
 use crate::types::*;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
+use openfang_channels::bridge::channel_command_specs;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
@@ -40,6 +41,9 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
+    /// Thread-safe mutable budget config. Updated via PUT /api/budget.
+    /// Initialized from `kernel.config.budget` at startup.
+    pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -363,7 +367,11 @@ pub async fn send_message(
     // (not as a separate session message which the LLM may not process).
     let content_blocks = if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
-        if image_blocks.is_empty() { None } else { Some(image_blocks) }
+        if image_blocks.is_empty() {
+            None
+        } else {
+            Some(image_blocks)
+        }
     } else {
         None
     };
@@ -428,9 +436,16 @@ pub async fn send_message(
 }
 
 /// GET /api/agents/:id/session — Get agent session (conversation history).
+///
+/// Query parameters:
+/// - `include_system` — when `true`, system-role messages are included in the
+///   response (intended for debugging only). Defaults to `false` so the
+///   internal system prompt is never leaked into the Web UI conversation
+///   history (issue #935).
 pub async fn get_agent_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
@@ -441,6 +456,14 @@ pub async fn get_agent_session(
             );
         }
     };
+
+    // SECURITY (#935): Default to filtering out system-role messages so the
+    // internal system prompt is never exposed in the Web UI conversation
+    // history. Callers can opt-in via `?include_system=true` for debugging.
+    let include_system = params
+        .get("include_system")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "TRUE" | "True"))
+        .unwrap_or(false);
 
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -454,6 +477,16 @@ pub async fn get_agent_session(
 
     match state.kernel.memory.get_session(entry.session_id) {
         Ok(Some(session)) => {
+            // Filter out system-role messages BEFORE any rendering / truncation
+            // logic so the system prompt cannot leak into the response. The
+            // raw message count is preserved separately for the API consumer.
+            let raw_message_count = session.messages.len();
+            let filtered_messages: Vec<&openfang_types::message::Message> = session
+                .messages
+                .iter()
+                .filter(|m| include_system || m.role != openfang_types::message::Role::System)
+                .collect();
+
             // Two-pass approach: ToolUse blocks live in Assistant messages while
             // ToolResult blocks arrive in subsequent User messages.  Pass 1
             // collects all tool_use entries keyed by id; pass 2 attaches results.
@@ -464,7 +497,8 @@ pub async fn get_agent_session(
             let mut tool_use_index: std::collections::HashMap<String, (usize, usize)> =
                 std::collections::HashMap::new();
 
-            for m in &session.messages {
+            for m in &filtered_messages {
+                let m = *m;
                 let mut tools: Vec<serde_json::Value> = Vec::new();
                 let mut msg_images: Vec<serde_json::Value> = Vec::new();
                 let content = match &m.content {
@@ -554,8 +588,8 @@ pub async fn get_agent_session(
                 built_messages.push(msg);
             }
 
-            // Pass 2: walk messages again and attach ToolResult to the correct tool
-            for m in &session.messages {
+            // Pass 2: walk filtered messages again and attach ToolResult to the correct tool
+            for m in &filtered_messages {
                 if let openfang_types::message::MessageContent::Blocks(blocks) = &m.content {
                     for b in blocks {
                         if let openfang_types::message::ContentBlock::ToolResult {
@@ -571,9 +605,8 @@ pub async fn get_agent_session(
                                         msg.get_mut("tools").and_then(|v| v.as_array_mut())
                                     {
                                         if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
-                                            let preview: String =
-                                                result.chars().take(2000).collect();
-                                            tool_obj["result"] = serde_json::Value::String(preview);
+                                            tool_obj["result"] =
+                                                serde_json::Value::String(result.clone());
                                             tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }
@@ -586,12 +619,16 @@ pub async fn get_agent_session(
             }
 
             let messages = built_messages;
+            // `message_count` reflects what the API actually returns (system
+            // messages excluded by default). `raw_message_count` is exposed
+            // for callers that need to know the underlying total.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "session_id": session.id.0.to_string(),
                     "agent_id": session.agent_id.0.to_string(),
-                    "message_count": session.messages.len(),
+                    "message_count": messages.len(),
+                    "raw_message_count": raw_message_count,
                     "context_window_tokens": session.context_window_tokens,
                     "label": session.label,
                     "messages": messages,
@@ -844,7 +881,26 @@ pub async fn create_workflow(
         created_at: chrono::Utc::now(),
     };
 
-    let id = state.kernel.register_workflow(workflow).await;
+    let id = state.kernel.register_workflow(workflow.clone()).await;
+
+    // Persist workflow to disk so it survives daemon restarts (#751)
+    let wf_dir = state
+        .kernel
+        .config
+        .workflows_dir
+        .clone()
+        .unwrap_or_else(|| state.kernel.config.home_dir.join("workflows"));
+    if let Err(e) = std::fs::create_dir_all(&wf_dir) {
+        tracing::warn!("Failed to create workflows dir: {e}");
+    } else {
+        let wf_path = wf_dir.join(format!("{}.json", id));
+        if let Ok(json) = serde_json::to_string_pretty(&workflow) {
+            if let Err(e) = std::fs::write(&wf_path, json) {
+                tracing::warn!("Failed to persist workflow {id}: {e}");
+            }
+        }
+    }
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"workflow_id": id.to_string()})),
@@ -1862,6 +1918,7 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
             ChannelField { key: "app_id", label: "App ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "cli_abc123", advanced: false },
             ChannelField { key: "app_secret_env", label: "App Secret", field_type: FieldType::Secret, env_var: Some("FEISHU_APP_SECRET"), required: true, placeholder: "abc123...", advanced: false },
             ChannelField { key: "region", label: "Region", field_type: FieldType::Text, env_var: None, required: false, placeholder: "cn or intl", advanced: false },
+            ChannelField { key: "mode", label: "Receive Mode", field_type: FieldType::Text, env_var: None, required: false, placeholder: "webhook|websocket", advanced: true },
             ChannelField { key: "webhook_port", label: "Webhook Port", field_type: FieldType::Number, env_var: None, required: false, placeholder: "8453", advanced: true },
             ChannelField { key: "webhook_path", label: "Webhook Path", field_type: FieldType::Text, env_var: None, required: false, placeholder: "/feishu/webhook", advanced: true },
             ChannelField { key: "verification_token", label: "Verification Token", field_type: FieldType::Text, env_var: None, required: false, placeholder: "verify-token", advanced: true },
@@ -1870,7 +1927,7 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
             ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
         ],
         setup_steps: &["Create an app at open.feishu.cn (CN) or open.larksuite.com (International)", "Copy App ID and Secret", "Set region: cn (Feishu) or intl (Lark)"],
-        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"\nregion = \"cn\"",
+        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"\nregion = \"cn\"\nmode = \"websocket\"",
     },
     ChannelMeta {
         name: "dingtalk", display_name: "DingTalk", icon: "DT",
@@ -2289,6 +2346,23 @@ fn build_field_json(
 /// Find a channel definition by name.
 fn find_channel_meta(name: &str) -> Option<&'static ChannelMeta> {
     CHANNEL_REGISTRY.iter().find(|c| c.name == name)
+}
+
+#[cfg(test)]
+mod channel_meta_tests {
+    use super::*;
+
+    #[test]
+    fn feishu_channel_meta_includes_mode_field() {
+        let meta = find_channel_meta("feishu").expect("feishu channel meta should exist");
+        assert!(meta.fields.iter().any(|f| f.key == "mode"));
+    }
+
+    #[test]
+    fn feishu_channel_meta_template_includes_websocket_mode_default() {
+        let meta = find_channel_meta("feishu").expect("feishu channel meta should exist");
+        assert!(meta.config_template.contains("mode = \"websocket\""));
+    }
 }
 
 /// Serialize a channel's config to a JSON Value for pre-populating dashboard forms.
@@ -3085,15 +3159,21 @@ pub async fn list_templates() -> impl IntoResponse {
                         .to_string_lossy()
                         .to_string();
 
-                    let description = std::fs::read_to_string(&manifest_path)
-                        .ok()
-                        .and_then(|content| toml::from_str::<AgentManifest>(&content).ok())
+                    let manifest_content = std::fs::read_to_string(&manifest_path).ok();
+                    let description = manifest_content
+                        .as_ref()
+                        .and_then(|content| toml::from_str::<AgentManifest>(content).ok())
                         .map(|m| m.description)
                         .unwrap_or_default();
+
+                    // Add category based on template name
+                    let category = get_template_category(&name);
 
                     templates.push(serde_json::json!({
                         "name": name,
                         "description": description,
+                        "category": category,
+                        "manifest_toml": manifest_content.unwrap_or_default(),
                     }));
                 }
             }
@@ -3104,6 +3184,24 @@ pub async fn list_templates() -> impl IntoResponse {
         "templates": templates,
         "total": templates.len(),
     }))
+}
+
+fn get_template_category(name: &str) -> &str {
+    match name {
+        "hello-world" | "assistant" => "General",
+        "researcher" | "analyst" => "Research",
+        "coder" | "debugger" | "devops-lead" => "Development",
+        "writer" | "doc-writer" => "Writing",
+        "ops" | "planner" => "Operations",
+        "architect" | "security-auditor" => "Development",
+        "code-reviewer" | "data-scientist" | "test-engineer" => "Development",
+        "legal-assistant" | "email-assistant" | "social-media" => "Business",
+        "customer-support" | "sales-assistant" | "recruiter" => "Business",
+        "meeting-assistant" => "Business",
+        "translator" | "tutor" | "health-tracker" => "General",
+        "personal-finance" | "travel-planner" | "home-automation" => "General",
+        _ => "General",
+    }
 }
 
 /// GET /api/templates/:name — Get template details.
@@ -3507,6 +3605,15 @@ pub async fn uninstall_skill(
     }
 }
 
+/// POST /api/skills/reload — Hot-reload the skill registry from disk.
+///
+/// Called by the CLI after `openfang skill install` to notify the running
+/// daemon that new skill files were added to the skills directory (#752).
+pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.kernel.reload_skills();
+    Json(serde_json::json!({"status": "reloaded"}))
+}
+
 /// GET /api/marketplace/search — Search the FangHub marketplace.
 pub async fn marketplace_search(
     Query(params): Query<HashMap<String, String>>,
@@ -3825,6 +3932,9 @@ pub async fn clawhub_install(
 
     match client.install(&req.slug, &skills_dir).await {
         Ok(result) => {
+            // Hot-reload so agents see the new skill immediately (#752)
+            state.kernel.reload_skills();
+
             let warnings: Vec<serde_json::Value> = result
                 .warnings
                 .iter()
@@ -3958,12 +4068,18 @@ pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoR
     let items: Vec<serde_json::Value> = instances
         .iter()
         .map(|i| {
+            // Effective agent name: custom instance_name takes priority, otherwise HAND.toml default.
+            let effective_agent_name = i
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| i.agent_name.clone());
             serde_json::json!({
                 "instance_id": i.instance_id,
                 "hand_id": i.hand_id,
+                "instance_name": i.instance_name,
                 "status": format!("{}", i.status),
                 "agent_id": i.agent_id.map(|a| a.to_string()),
-                "agent_name": i.agent_name,
+                "agent_name": effective_agent_name,
                 "activated_at": i.activated_at.to_rfc3339(),
                 "updated_at": i.updated_at.to_rfc3339(),
             })
@@ -4427,9 +4543,12 @@ pub async fn activate_hand(
     Path(hand_id): Path<String>,
     body: Option<Json<openfang_hands::ActivateHandRequest>>,
 ) -> impl IntoResponse {
-    let config = body.map(|b| b.0.config).unwrap_or_default();
+    let (config, instance_name) = match body.map(|b| b.0) {
+        Some(r) => (r.config, r.instance_name),
+        None => (std::collections::HashMap::new(), None),
+    };
 
-    match state.kernel.activate_hand(&hand_id, config) {
+    match state.kernel.activate_hand(&hand_id, config, instance_name) {
         Ok(instance) => {
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
@@ -4453,14 +4572,19 @@ pub async fn activate_hand(
                     }
                 }
             }
+            let effective_agent_name = instance
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| instance.agent_name.clone());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "instance_id": instance.instance_id,
                     "hand_id": instance.hand_id,
+                    "instance_name": instance.instance_name,
                     "status": format!("{}", instance.status),
                     "agent_id": instance.agent_id.map(|a| a.to_string()),
-                    "agent_name": instance.agent_name,
+                    "agent_name": effective_agent_name,
                     "activated_at": instance.activated_at.to_rfc3339(),
                 })),
             )
@@ -4803,6 +4927,12 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
                 openfang_types::config::McpTransportEntry::Sse { url } => {
                     serde_json::json!({
                         "type": "sse",
+                        "url": url,
+                    })
+                }
+                openfang_types::config::McpTransportEntry::Http { url } => {
+                    serde_json::json!({
+                        "type": "http",
                         "url": url,
                     })
                 }
@@ -5247,10 +5377,8 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5259,34 +5387,26 @@ pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // SAFETY: Budget config is updated in-place. Since KernelConfig is behind
-    // an Arc and we only have &self, we use ptr mutation (same pattern as OFP).
-    let config_ptr = &state.kernel.config as *const openfang_types::config::KernelConfig
-        as *mut openfang_types::config::KernelConfig;
-
-    // Apply updates
-    unsafe {
+    {
+        let mut budget = state.budget_config.write().await;
         if let Some(v) = body["max_hourly_usd"].as_f64() {
-            (*config_ptr).budget.max_hourly_usd = v;
+            budget.max_hourly_usd = v;
         }
         if let Some(v) = body["max_daily_usd"].as_f64() {
-            (*config_ptr).budget.max_daily_usd = v;
+            budget.max_daily_usd = v;
         }
         if let Some(v) = body["max_monthly_usd"].as_f64() {
-            (*config_ptr).budget.max_monthly_usd = v;
+            budget.max_monthly_usd = v;
         }
         if let Some(v) = body["alert_threshold"].as_f64() {
-            (*config_ptr).budget.alert_threshold = v.clamp(0.0, 1.0);
+            budget.alert_threshold = v.clamp(0.0, 1.0);
         }
         if let Some(v) = body["default_max_llm_tokens_per_hour"].as_u64() {
-            (*config_ptr).budget.default_max_llm_tokens_per_hour = v;
+            budget.default_max_llm_tokens_per_hour = v;
         }
     }
-
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5727,6 +5847,11 @@ pub async fn patch_agent(
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.registry.get(agent_id) {
         let _ = state.kernel.memory.save_agent(&entry);
+
+        // Write updated manifest to agent.toml on disk so disk doesn't override
+        // dashboard changes on next boot (#996, #1018).
+        state.kernel.persist_manifest_to_disk(agent_id);
+
         (
             StatusCode::OK,
             Json(
@@ -8817,20 +8942,16 @@ pub async fn patch_agent_config(
         if !new_model.is_empty() {
             if let Some(ref new_provider) = req.provider {
                 if !new_provider.is_empty() {
-                    // Explicit provider given — use it directly
-                    if state
-                        .kernel
-                        .registry
-                        .update_model_and_provider(
-                            agent_id,
-                            new_model.clone(),
-                            new_provider.clone(),
-                        )
-                        .is_err()
+                    // Explicit provider given — still route through set_agent_model
+                    // so provider-specific auth/env hints stay in sync.
+                    if let Err(e) =
+                        state
+                            .kernel
+                            .set_agent_model(agent_id, new_model, Some(new_provider))
                     {
                         return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({"error": "Agent not found"})),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("{e}")})),
                         );
                     }
                 } else {
@@ -8875,6 +8996,10 @@ pub async fn patch_agent_config(
             tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
+
+    // Write updated manifest to agent.toml on disk so disk doesn't override
+    // dashboard changes on next boot (#996, #1018).
+    state.kernel.persist_manifest_to_disk(agent_id);
 
     (
         StatusCode::OK,
@@ -9304,16 +9429,14 @@ fn is_allowed_content_type(ct: &str) -> bool {
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
 ///
-/// Accepts raw body bytes. The client must set:
-/// - `Content-Type` header (e.g., `image/png`, `text/plain`, `application/pdf`)
-/// - `X-Filename` header (original filename)
+/// Accepts multipart/form-data. The client must include a file field with:
+/// - `Content-Type` field (e.g., `image/png`, `text/plain`, `application/pdf`)
+/// - `filename` attribute (original filename)
 pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
-    // Validate agent ID format
     let _agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
@@ -9324,12 +9447,62 @@ pub async fn upload_file(
         }
     };
 
-    // Extract content type
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let mut file_data: Option<(Option<String>, String, axum::body::Bytes)> = None;
+    let mut filename_from_field: Option<String> = None;
+
+    while let Some(field) = multipart.next_field().await.transpose() {
+        let field = match field {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Failed to read field: {}", e)})),
+                );
+            }
+        };
+
+        let field_name = field.name().unwrap_or("").to_string();
+
+        match field_name.as_str() {
+            "file" => {
+                let filename_attr = field.file_name().map(|s| s.to_string());
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let bytes = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                serde_json::json!({"error": format!("Failed to read file: {}", e)}),
+                            ),
+                        );
+                    }
+                };
+                file_data = Some((filename_attr, content_type, bytes));
+            }
+            "filename" => {
+                filename_from_field = field.text().await.ok();
+            }
+            _ => {}
+        }
+    }
+
+    let (filename_attr, content_type, body) = match file_data {
+        Some(data) => data,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No file provided"})),
+            );
+        }
+    };
+
+    let filename = filename_from_field
+        .or(filename_attr)
+        .unwrap_or_else(|| "upload".to_string());
 
     if !is_allowed_content_type(&content_type) {
         return (
@@ -9339,13 +9512,6 @@ pub async fn upload_file(
             ),
         );
     }
-
-    // Extract filename from header
-    let filename = headers
-        .get("X-Filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("upload")
-        .to_string();
 
     // Validate size
     if body.len() > MAX_UPLOAD_SIZE {
@@ -9491,25 +9657,28 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
 // Execution Approval System — backed by kernel.approval_manager
 // ---------------------------------------------------------------------------
 
-/// GET /api/approvals — List pending approval requests.
+/// GET /api/approvals — List pending and recent approval requests.
 ///
 /// Transforms field names to match the dashboard template expectations:
 /// `action_summary` → `action`, `agent_id` → `agent_name`, `requested_at` → `created_at`.
 pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pending = state.kernel.approval_manager.list_pending();
-    let total = pending.len();
+    let recent = state.kernel.approval_manager.list_recent(50);
 
     // Resolve agent names for display
     let registry_agents = state.kernel.registry.list();
+    let agent_name_for = |agent_id: &str| {
+        registry_agents
+            .iter()
+            .find(|ag| ag.id.to_string() == agent_id || ag.name == agent_id)
+            .map(|ag| ag.name.clone())
+            .unwrap_or_else(|| agent_id.to_string())
+    };
 
-    let approvals: Vec<serde_json::Value> = pending
+    let mut approvals: Vec<serde_json::Value> = pending
         .into_iter()
         .map(|a| {
-            let agent_name = registry_agents
-                .iter()
-                .find(|ag| ag.id.to_string() == a.agent_id || ag.name == a.agent_id)
-                .map(|ag| ag.name.as_str())
-                .unwrap_or(&a.agent_id);
+            let agent_name = agent_name_for(&a.agent_id);
             serde_json::json!({
                 "id": a.id,
                 "agent_id": a.agent_id,
@@ -9526,6 +9695,42 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             })
         })
         .collect();
+
+    approvals.extend(recent.into_iter().map(|record| {
+        let request = record.request;
+        let agent_name = agent_name_for(&request.agent_id);
+        let status = match record.decision {
+            openfang_types::approval::ApprovalDecision::Approved => "approved",
+            openfang_types::approval::ApprovalDecision::Denied => "rejected",
+            openfang_types::approval::ApprovalDecision::TimedOut => "expired",
+        };
+        serde_json::json!({
+            "id": request.id,
+            "agent_id": request.agent_id,
+            "agent_name": agent_name,
+            "tool_name": request.tool_name,
+            "description": request.description,
+            "action_summary": request.action_summary,
+            "action": request.action_summary,
+            "risk_level": request.risk_level,
+            "requested_at": request.requested_at,
+            "created_at": request.requested_at,
+            "timeout_secs": request.timeout_secs,
+            "status": status,
+            "decided_at": record.decided_at,
+            "decided_by": record.decided_by,
+        })
+    }));
+
+    approvals.sort_by(|a, b| {
+        let a_pending = a["status"].as_str() == Some("pending");
+        let b_pending = b["status"].as_str() == Some("pending");
+        b_pending
+            .cmp(&a_pending)
+            .then_with(|| b["created_at"].as_str().cmp(&a["created_at"].as_str()))
+    });
+
+    let total = approvals.len();
 
     Json(serde_json::json!({"approvals": approvals, "total": total}))
 }
@@ -9713,78 +9918,84 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .collect();
     drop(catalog);
 
+    // Helper: normalize field definitions to objects with {name, type, label}
+    // so the frontend template can iterate and render inputs correctly.
+    let f = |name: &str, ftype: &str, label: &str| -> serde_json::Value {
+        serde_json::json!({"name": name, "type": ftype, "label": label})
+    };
+
     Json(serde_json::json!({
         "sections": {
             "general": {
                 "root_level": true,
-                "fields": {
-                    "api_listen": "string",
-                    "api_key": "string",
-                    "log_level": "string"
-                }
+                "fields": [
+                    f("api_listen", "string", "API Listen Address"),
+                    f("api_key", "string", "API Key"),
+                    f("log_level", "string", "Log Level")
+                ]
             },
             "default_model": {
                 "hot_reloadable": true,
-                "fields": {
-                    "provider": { "type": "select", "options": provider_options },
-                    "model": { "type": "select", "options": model_options },
-                    "api_key_env": "string",
-                    "base_url": "string"
-                }
+                "fields": [
+                    { "name": "provider", "type": "select", "label": "Provider", "options": provider_options },
+                    { "name": "model", "type": "select", "label": "Model", "options": model_options },
+                    f("api_key_env", "string", "API Key Env Var"),
+                    f("base_url", "string", "Base URL")
+                ]
             },
             "memory": {
-                "fields": {
-                    "decay_rate": "number",
-                    "vector_dims": "number"
-                }
+                "fields": [
+                    f("decay_rate", "number", "Decay Rate"),
+                    f("vector_dims", "number", "Vector Dimensions")
+                ]
             },
             "web": {
-                "fields": {
-                    "provider": "string",
-                    "timeout_secs": "number",
-                    "max_results": "number"
-                }
+                "fields": [
+                    f("provider", "string", "Search Provider"),
+                    f("timeout_secs", "number", "Timeout (seconds)"),
+                    f("max_results", "number", "Max Results")
+                ]
             },
             "browser": {
-                "fields": {
-                    "headless": "boolean",
-                    "timeout_secs": "number",
-                    "executable_path": "string"
-                }
+                "fields": [
+                    f("headless", "boolean", "Headless Mode"),
+                    f("timeout_secs", "number", "Timeout (seconds)"),
+                    f("executable_path", "string", "Chrome/Chromium Path")
+                ]
             },
             "network": {
-                "fields": {
-                    "enabled": "boolean",
-                    "listen_addr": "string",
-                    "shared_secret": "string"
-                }
+                "fields": [
+                    f("enabled", "boolean", "Enable OFP Network"),
+                    f("listen_addr", "string", "Listen Address"),
+                    f("shared_secret", "string", "Shared Secret")
+                ]
             },
             "extensions": {
-                "fields": {
-                    "auto_connect": "boolean",
-                    "health_check_interval_secs": "number"
-                }
+                "fields": [
+                    f("auto_connect", "boolean", "Auto Connect"),
+                    f("health_check_interval_secs", "number", "Health Check Interval (s)")
+                ]
             },
             "vault": {
-                "fields": {
-                    "path": "string"
-                }
+                "fields": [
+                    f("path", "string", "Vault Path")
+                ]
             },
             "a2a": {
-                "fields": {
-                    "enabled": "boolean",
-                    "name": "string",
-                    "description": "string",
-                    "url": "string"
-                }
+                "fields": [
+                    f("enabled", "boolean", "Enable A2A"),
+                    f("name", "string", "Agent Name"),
+                    f("description", "string", "Description"),
+                    f("url", "string", "URL")
+                ]
             },
             "channels": {
-                "fields": {
-                    "telegram": "object",
-                    "discord": "object",
-                    "slack": "object",
-                    "whatsapp": "object"
-                }
+                "fields": [
+                    f("telegram", "object", "Telegram"),
+                    f("discord", "object", "Discord"),
+                    f("slack", "object", "Slack"),
+                    f("whatsapp", "object", "WhatsApp")
+                ]
             }
         }
     }))
@@ -10118,6 +10329,66 @@ pub async fn cron_job_status(
             Json(serde_json::json!({"error": "Invalid job ID"})),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run cron job on demand
+// ---------------------------------------------------------------------------
+
+/// POST /api/cron/jobs/{id}/run — Trigger a cron job immediately.
+///
+/// Returns `{"status": "triggered", "job_id": "..."}` and spawns the execution
+/// in the background.  The job's status can be polled via
+/// `GET /api/cron/jobs/{id}/status`.
+pub async fn run_cron_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Invalid job ID"})),
+            );
+        }
+    };
+    let job_id = openfang_types::scheduler::CronJobId(uuid);
+
+    // Atomically check existence + enabled + reserve next_run in one lock hold.
+    let job = match state.kernel.cron_scheduler.try_claim_for_run(job_id) {
+        Ok(j) => j,
+        Err(openfang_kernel::cron::ClaimError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"status": "error", "error": "Job not found"})),
+            );
+        }
+        Err(openfang_kernel::cron::ClaimError::Disabled) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Job is disabled"})),
+            );
+        }
+    };
+
+    // Spawn execution in the background so we don't block the HTTP response.
+    let kernel = Arc::clone(&state.kernel);
+    let job_name = job.name.clone();
+    tokio::spawn(async move {
+        match kernel.cron_run_job(&job).await {
+            Ok(_) => tracing::info!(job = %job_name, "On-demand cron job completed"),
+            Err(e) => tracing::warn!(job = %job_name, error = %e, "On-demand cron job failed"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "triggered",
+            "job_id": id,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -10475,21 +10746,24 @@ pub async fn pairing_notify(
 
 /// GET /api/commands — List available chat commands (for dynamic slash menu).
 pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut commands = vec![
-        serde_json::json!({"cmd": "/help", "desc": "Show available commands"}),
-        serde_json::json!({"cmd": "/new", "desc": "Reset session (clear history)"}),
-        serde_json::json!({"cmd": "/compact", "desc": "Trigger LLM session compaction"}),
-        serde_json::json!({"cmd": "/model", "desc": "Show or switch model (/model [name])"}),
-        serde_json::json!({"cmd": "/stop", "desc": "Cancel current agent run"}),
-        serde_json::json!({"cmd": "/usage", "desc": "Show session token usage & cost"}),
-        serde_json::json!({"cmd": "/think", "desc": "Toggle extended thinking (/think [on|off|stream])"}),
+    let mut commands: Vec<serde_json::Value> = channel_command_specs()
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "cmd": format!("/{}", spec.name),
+                "desc": spec.desc,
+                "source": "channel",
+            })
+        })
+        .collect();
+
+    commands.extend([
         serde_json::json!({"cmd": "/context", "desc": "Show context window usage & pressure"}),
         serde_json::json!({"cmd": "/verbose", "desc": "Cycle tool detail level (/verbose [off|on|full])"}),
         serde_json::json!({"cmd": "/queue", "desc": "Check if agent is processing"}),
-        serde_json::json!({"cmd": "/status", "desc": "Show system status"}),
         serde_json::json!({"cmd": "/clear", "desc": "Clear chat display"}),
         serde_json::json!({"cmd": "/exit", "desc": "Disconnect from agent"}),
-    ];
+    ]);
 
     // Add skill-registered tool names as potential commands
     if let Ok(registry) = state.kernel.skill_registry.read() {

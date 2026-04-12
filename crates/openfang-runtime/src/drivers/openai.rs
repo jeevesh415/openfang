@@ -7,6 +7,7 @@ use crate::think_filter::{FilterAction, StreamingThinkFilter};
 use async_trait::async_trait;
 use futures::StreamExt;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
+use openfang_types::model_catalog::MOONSHOT_KIMI_BASE_URL;
 use openfang_types::tool::ToolCall;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -84,7 +85,17 @@ impl OpenAIDriver {
                 AZURE_API_VERSION,
             )
         } else {
-            format!("{}/chat/completions", self.base_url)
+            // Kimi K2/K2.5 models live on api.moonshot.cn, not api.moonshot.ai.
+            // When the moonshot provider is configured with the default .ai URL
+            // but the model is a kimi-k2* model, redirect to the .cn endpoint.
+            let effective_url = if self.base_url.contains("api.moonshot.ai")
+                && model.to_lowercase().starts_with("kimi-k2")
+            {
+                MOONSHOT_KIMI_BASE_URL
+            } else {
+                &self.base_url
+            };
+            format!("{}/chat/completions", effective_url)
         }
     }
 
@@ -99,8 +110,7 @@ impl OpenAIDriver {
         if self.azure_mode {
             builder = builder.header("api-key", self.api_key.as_str());
         } else {
-            builder =
-                builder.header("authorization", format!("Bearer {}", self.api_key.as_str()));
+            builder = builder.header("authorization", format!("Bearer {}", self.api_key.as_str()));
         }
         builder
     }
@@ -263,6 +273,22 @@ struct OaiUsage {
     completion_tokens: u64,
 }
 
+/// Strip trailing empty assistant messages without tool calls.
+/// Some API proxies reject empty assistant messages as "prefill".
+fn strip_trailing_empty_assistant(messages: &mut Vec<OaiMessage>) {
+    while messages.last().map_or(false, |m| {
+        m.role == "assistant"
+            && m.tool_calls.is_none()
+            && match &m.content {
+                None => true,
+                Some(OaiMessageContent::Text(t)) => t.trim().is_empty(),
+                _ => false,
+            }
+    }) {
+        messages.pop();
+    }
+}
+
 #[async_trait]
 impl LlmDriver for OpenAIDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
@@ -418,6 +444,8 @@ impl LlmDriver for OpenAIDriver {
             }
         }
 
+        strip_trailing_empty_assistant(&mut oai_messages);
+
         let oai_tools: Vec<OaiTool> = request
             .tools
             .iter()
@@ -445,6 +473,7 @@ impl LlmDriver for OpenAIDriver {
         } else {
             (Some(request.max_tokens), None)
         };
+
         let mut oai_request = OaiRequest {
             model: request.model.clone(),
             messages: oai_messages,
@@ -682,8 +711,8 @@ impl LlmDriver for OpenAIDriver {
 
             if let Some(calls) = choice.message.tool_calls {
                 for call in calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                    let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
                     content.push(ContentBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
@@ -873,6 +902,8 @@ impl LlmDriver for OpenAIDriver {
                 _ => {}
             }
         }
+
+        strip_trailing_empty_assistant(&mut oai_messages);
 
         let oai_tools: Vec<OaiTool> = request
             .tools
@@ -1150,7 +1181,10 @@ impl LlmDriver for OpenAIDriver {
                         }
 
                         // Reasoning/thinking content delta (DeepSeek-R1, Qwen3 via LM Studio/Ollama)
-                        if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                        if let Some(reasoning) = delta["reasoning_content"]
+                            .as_str()
+                            .or_else(|| delta["reasoning"].as_str())
+                        {
                             if !reasoning.is_empty() {
                                 reasoning_content.push_str(reasoning);
                                 let _ = tx
@@ -1173,7 +1207,10 @@ impl LlmDriver for OpenAIDriver {
 
                                 // ID (sent in first chunk for this tool)
                                 if let Some(id) = call["id"].as_str() {
-                                    tool_accum[idx].0 = id.to_string();
+                                    // Fix: Empty string IDs are overwritten, leading to inconsistencies in certain models.
+                                    if !id.is_empty() {
+                                        tool_accum[idx].0 = id.to_string();
+                                    }
                                 }
 
                                 if let Some(func) = call.get("function") {
@@ -1312,7 +1349,18 @@ impl LlmDriver for OpenAIDriver {
             }
 
             for (id, name, arguments) in &tool_accum {
-                let input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+                // Skip malformed tool calls (empty ID or name can happen if
+                // streaming chunks arrive out of order or are dropped by proxy).
+                if id.is_empty() || name.is_empty() {
+                    warn!(
+                        tool_id = %id,
+                        tool_name = %name,
+                        "Skipping tool call with empty ID or name from streaming response"
+                    );
+                    continue;
+                }
+                let input: serde_json::Value =
+                    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -1322,14 +1370,14 @@ impl LlmDriver for OpenAIDriver {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
-                    input,
+                    input: input.clone(),
                 });
 
                 let _ = tx
                     .send(StreamEvent::ToolUseEnd {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::from_str(arguments).unwrap_or_default(),
+                        input,
                     })
                     .await;
             }
@@ -1829,5 +1877,25 @@ mod tests {
         );
         let url = driver.chat_url("gpt-4o");
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+    }
+
+    /// Regression test for #970: kimi-k2.5 on moonshot.ai should redirect to moonshot.cn
+    #[test]
+    fn test_kimi_k2_redirects_to_moonshot_cn() {
+        let driver = OpenAIDriver::new(
+            "test-key".to_string(),
+            "https://api.moonshot.ai/v1".to_string(),
+        );
+        // kimi-k2.5 must go to the .cn endpoint
+        let url = driver.chat_url("kimi-k2.5");
+        assert_eq!(url, "https://api.moonshot.cn/v1/chat/completions");
+
+        // kimi-k2 must also redirect
+        let url = driver.chat_url("kimi-k2");
+        assert_eq!(url, "https://api.moonshot.cn/v1/chat/completions");
+
+        // moonshot-v1-128k should NOT redirect (stays on .ai)
+        let url = driver.chat_url("moonshot-v1-128k");
+        assert_eq!(url, "https://api.moonshot.ai/v1/chat/completions");
     }
 }

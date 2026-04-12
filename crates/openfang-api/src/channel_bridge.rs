@@ -30,6 +30,7 @@ use openfang_channels::messenger::MessengerAdapter;
 use openfang_channels::reddit::RedditAdapter;
 use openfang_channels::revolt::RevoltAdapter;
 use openfang_channels::viber::ViberAdapter;
+use openfang_types::config::FeishuMode;
 // Wave 4
 use openfang_channels::flock::FlockAdapter;
 use openfang_channels::guilded::GuildedAdapter;
@@ -48,6 +49,7 @@ use openfang_channels::discourse::DiscourseAdapter;
 use openfang_channels::gitter::GitterAdapter;
 use openfang_channels::gotify::GotifyAdapter;
 use openfang_channels::linkedin::LinkedInAdapter;
+use openfang_channels::mqtt::MqttAdapter;
 use openfang_channels::mumble::MumbleAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
@@ -809,7 +811,21 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             "webhook" => channels.webhook.as_ref().map(|c| c.overrides.clone()),
             "linkedin" => channels.linkedin.as_ref().map(|c| c.overrides.clone()),
             "wecom" => channels.wecom.as_ref().map(|c| c.overrides.clone()),
+            "mqtt" => channels.mqtt.as_ref().map(|c| c.overrides.clone()),
             _ => None,
+        }
+    }
+
+    async fn free_response_channels(&self, channel_type: &str) -> Vec<String> {
+        let channels = &self.kernel.config.channels;
+        match channel_type {
+            "discord" => channels
+                .discord
+                .as_ref()
+                .map(|c| c.free_response_channels.clone())
+                .unwrap_or_default(),
+            // Add other channel types here as needed (e.g., "telegram" => ...)
+            _ => Vec::new(),
         }
     }
 
@@ -1219,6 +1235,7 @@ pub async fn start_channel_bridge_with_config(
                 mx_config.user_id.clone(),
                 token,
                 mx_config.allowed_rooms.clone(),
+                mx_config.auto_accept_invites,
             ));
             adapters.push((adapter, mx_config.default_agent.clone()));
         }
@@ -1430,16 +1447,22 @@ pub async fn start_channel_bridge_with_config(
                 .encrypt_key_env
                 .as_ref()
                 .and_then(|env| read_token(env, "Feishu encrypt_key"));
-            let adapter = Arc::new(FeishuAdapter::with_config(
-                fs_config.app_id.clone(),
-                secret,
-                fs_config.webhook_port,
-                region,
-                Some(fs_config.webhook_path.clone()),
-                fs_config.verification_token.clone(),
-                encrypt_key,
-                fs_config.bot_names.clone(),
-            ));
+            let adapter = match fs_config.mode {
+                FeishuMode::Webhook => Arc::new(FeishuAdapter::with_config(
+                    fs_config.app_id.clone(),
+                    secret,
+                    fs_config.webhook_port,
+                    region,
+                    Some(fs_config.webhook_path.clone()),
+                    fs_config.verification_token.clone(),
+                    encrypt_key,
+                    fs_config.bot_names.clone(),
+                )),
+                FeishuMode::Websocket => Arc::new(FeishuAdapter::new_websocket(
+                    fs_config.app_id.clone(),
+                    secret,
+                )),
+            };
             adapters.push((adapter, fs_config.default_agent.clone()));
         }
     }
@@ -1447,8 +1470,15 @@ pub async fn start_channel_bridge_with_config(
     // Revolt
     if let Some(ref rv_config) = config.revolt {
         if let Some(token) = read_token(&rv_config.bot_token_env, "Revolt") {
-            let adapter = Arc::new(RevoltAdapter::new(token));
-            adapters.push((adapter, rv_config.default_agent.clone()));
+            let mut adapter = RevoltAdapter::with_urls(
+                token,
+                rv_config.api_url.clone(),
+                rv_config.ws_url.clone(),
+            );
+            if !rv_config.allowed_channels.is_empty() {
+                adapter.set_allowed_channels(rv_config.allowed_channels.clone());
+            }
+            adapters.push((Arc::new(adapter), rv_config.default_agent.clone()));
         }
     }
 
@@ -1670,6 +1700,25 @@ pub async fn start_channel_bridge_with_config(
         }
     }
 
+    // MQTT
+    if let Some(ref mq_config) = config.mqtt {
+        let username = read_token(&mq_config.username_env, "MQTT (username)");
+        let password = read_token(&mq_config.password_env, "MQTT (password)");
+        let adapter = Arc::new(MqttAdapter::new(
+            mq_config.broker_url.clone(),
+            mq_config.client_id.clone(),
+            mq_config.subscribe_topic.clone(),
+            mq_config.publish_topic.clone(),
+            username,
+            password,
+            mq_config.use_tls,
+            mq_config.keep_alive_secs,
+            mq_config.clean_session,
+            mq_config.qos,
+        ));
+        adapters.push((adapter, mq_config.default_agent.clone()));
+    }
+
     if adapters.is_empty() {
         return (None, Vec::new());
     }
@@ -1873,5 +1922,36 @@ mod tests {
         assert!(config.channels.gotify.is_none());
         assert!(config.channels.webhook.is_none());
         assert!(config.channels.linkedin.is_none());
+    }
+
+    #[test]
+    fn test_feishu_bridge_mode_defaults_to_websocket() {
+        let config: openfang_types::config::KernelConfig = toml::from_str(
+            r#"
+            [channels.feishu]
+            app_id = "cli_test"
+            app_secret_env = "FEISHU_APP_SECRET"
+            "#,
+        )
+        .unwrap();
+
+        let feishu = config.channels.feishu.expect("feishu config should exist");
+        assert_eq!(feishu.mode, openfang_types::config::FeishuMode::Websocket);
+    }
+
+    #[test]
+    fn test_feishu_bridge_mode_supports_websocket() {
+        let config: openfang_types::config::KernelConfig = toml::from_str(
+            r#"
+            [channels.feishu]
+            app_id = "cli_test"
+            app_secret_env = "FEISHU_APP_SECRET"
+            mode = "websocket"
+            "#,
+        )
+        .unwrap();
+
+        let feishu = config.channels.feishu.expect("feishu config should exist");
+        assert_eq!(feishu.mode, openfang_types::config::FeishuMode::Websocket);
     }
 }

@@ -237,6 +237,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Dashboard authentication [*].
+    #[command(subcommand)]
+    Auth(AuthCommands),
     /// Security tools and audit trail [*].
     #[command(subcommand)]
     Security(SecurityCommands),
@@ -403,6 +406,9 @@ enum HandCommands {
     Activate {
         /// Hand ID (e.g. "clip", "lead", "researcher").
         id: String,
+        /// Optional instance name. Required to run multiple instances of the same hand.
+        #[arg(long, short = 'n')]
+        name: Option<String>,
     },
     /// Deactivate an active hand instance.
     Deactivate {
@@ -680,6 +686,12 @@ enum CronCommands {
 }
 
 #[derive(Subcommand)]
+enum AuthCommands {
+    /// Generate an Argon2id password hash for dashboard authentication.
+    HashPassword,
+}
+
+#[derive(Subcommand)]
 enum SecurityCommands {
     /// Show security status summary.
     Status {
@@ -829,6 +841,7 @@ fn init_tracing_stderr() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config_log_level())),
         )
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -866,6 +879,21 @@ fn init_tracing_file() {
                 .with_writer(std::io::sink)
                 .init();
         }
+    }
+}
+
+/// Write `msg` to stdout, silently exiting with code 0 on BrokenPipe.
+/// Use this instead of `println!` for machine-readable (JSON) output that is
+/// commonly piped into other tools.
+fn write_stdout_safe(msg: &str) {
+    let out = std::io::stdout();
+    let mut lock = out.lock();
+    if let Err(e) = writeln!(lock, "{}", msg) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("error: failed writing to stdout: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -975,7 +1003,7 @@ fn main() {
             HandCommands::List => cmd_hand_list(),
             HandCommands::Active => cmd_hand_active(),
             HandCommands::Install { path } => cmd_hand_install(&path),
-            HandCommands::Activate { id } => cmd_hand_activate(&id),
+            HandCommands::Activate { id, name } => cmd_hand_activate(&id, name),
             HandCommands::Deactivate { id } => cmd_hand_deactivate(&id),
             HandCommands::Info { id } => cmd_hand_info(&id),
             HandCommands::CheckDeps { id } => cmd_hand_check_deps(&id),
@@ -1041,6 +1069,9 @@ fn main() {
         Some(Commands::Sessions { agent, json }) => cmd_sessions(agent.as_deref(), json),
         Some(Commands::Logs { lines, follow }) => cmd_logs(lines, follow),
         Some(Commands::Health { json }) => cmd_health(json),
+        Some(Commands::Auth(sub)) => match sub {
+            AuthCommands::HashPassword => cmd_auth_hash_password(),
+        },
         Some(Commands::Security(sub)) => match sub {
             SecurityCommands::Status { json } => cmd_security_status(json),
             SecurityCommands::Audit { limit, json } => cmd_security_audit(limit, json),
@@ -2115,18 +2146,14 @@ fn cmd_doctor(json: bool, repair: bool) {
                             ui::check_ok(".env file (permissions fixed to 0600)");
                         }
                         repaired = true;
-                    } else {
-                        if !json {
-                            ui::check_warn(&format!(
-                                ".env file has loose permissions ({:o}), should be 0600",
-                                mode
-                            ));
-                        }
+                    } else if !json {
+                        ui::check_warn(&format!(
+                            ".env file has loose permissions ({:o}), should be 0600",
+                            mode
+                        ));
                     }
-                } else {
-                    if !json {
-                        ui::check_ok(".env file");
-                    }
+                } else if !json {
+                    ui::check_ok(".env file");
                 }
             }
             #[cfg(not(unix))]
@@ -2402,6 +2429,7 @@ decay_rate = 0.05
         ("TOGETHER_API_KEY", "Together", "together"),
         ("MISTRAL_API_KEY", "Mistral", "mistral"),
         ("FIREWORKS_API_KEY", "Fireworks", "fireworks"),
+        ("AWS_BEARER_TOKEN_BEDROCK", "AWS Bedrock", "bedrock"),
     ];
 
     let mut any_key_set = false;
@@ -2414,16 +2442,31 @@ decay_rate = 0.05
                 if !json {
                     ui::provider_status(name, env_var, true);
                 }
-            } else if !json {
-                ui::check_warn(&format!("{name} ({env_var}) - key rejected (401/403)"));
+            } else {
+                if !json {
+                    ui::check_fail(&format!("{name} ({env_var}) - key rejected (401/403)"));
+                }
+                all_ok = false;
             }
             any_key_set = true;
-            checks.push(serde_json::json!({"check": "provider", "name": name, "env_var": env_var, "status": if valid { "ok" } else { "warn" }, "live_test": !valid}));
+            checks.push(serde_json::json!({"check": "provider", "name": name, "env_var": env_var, "status": if valid { "ok" } else { "fail" }, "live_test": !valid}));
         } else {
             if !json {
                 ui::provider_status(name, env_var, false);
             }
             checks.push(serde_json::json!({"check": "provider", "name": name, "env_var": env_var, "status": "warn"}));
+        }
+    }
+
+    // Check GitHub Copilot auth (separate from env var checks)
+    {
+        let openfang_dir = cli_openfang_home();
+        if openfang_runtime::drivers::copilot::copilot_auth_available(&openfang_dir) {
+            any_key_set = true;
+            if !json {
+                ui::check_ok("GitHub Copilot (authenticated via device flow)");
+            }
+            checks.push(serde_json::json!({"check": "provider", "name": "GitHub Copilot", "status": "ok"}));
         }
     }
 
@@ -2580,7 +2623,8 @@ decay_rate = 0.05
                                         checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
                                     }
                                 }
-                                openfang_types::config::McpTransportEntry::Sse { url } => {
+                                openfang_types::config::McpTransportEntry::Sse { url }
+                                | openfang_types::config::McpTransportEntry::Http { url } => {
                                     if url.is_empty() {
                                         if !json {
                                             ui::check_warn(&format!(
@@ -2626,9 +2670,7 @@ decay_rate = 0.05
         // Check workspace skills if home dir available
         if skills_dir.exists() {
             match skill_reg.load_workspace_skills(&skills_dir) {
-                Ok(_) => {
-                    let total = skill_reg.count();
-                    let ws_count = total.saturating_sub(bundled_count);
+                Ok(ws_count) => {
                     if ws_count > 0 {
                         if !json {
                             ui::check_ok(&format!("Workspace skills loaded: {ws_count}"));
@@ -2670,8 +2712,15 @@ decay_rate = 0.05
                 }
             }
         }
-        if injection_warnings > 0 {
-            checks.push(serde_json::json!({"check": "skill_injection_scan", "status": "warn", "warnings": injection_warnings}));
+        let blocked = skill_reg.blocked_count();
+        if injection_warnings > 0 || blocked > 0 {
+            let total_warnings = injection_warnings + blocked;
+            if blocked > 0 && !json {
+                ui::check_warn(&format!(
+                    "{blocked} workspace skill(s) were blocked for critical prompt injection"
+                ));
+            }
+            checks.push(serde_json::json!({"check": "skill_injection_scan", "status": "warn", "warnings": total_warnings, "blocked": blocked}));
         } else {
             if !json {
                 ui::check_ok("All skills pass prompt injection scan");
@@ -2909,19 +2958,20 @@ decay_rate = 0.05
     }
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        write_stdout_safe(
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "all_ok": all_ok,
                 "checks": checks,
             }))
-            .unwrap_or_default()
+            .unwrap_or_default(),
         );
     } else {
         println!();
         if all_ok {
             ui::success("All checks passed! OpenFang is ready.");
-            ui::hint("Start the daemon: openfang start");
+            if find_daemon().is_none() {
+                ui::hint("Start the daemon: openfang start");
+            }
         } else if repaired {
             ui::success("Repairs applied. Re-run `openfang doctor` to verify.");
         } else {
@@ -3488,6 +3538,7 @@ fn cmd_skill_install(source: &str) {
                             std::process::exit(1);
                         }
                         println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        notify_daemon_skill_reload();
                     }
                     Err(e) => {
                         eprintln!("Failed to convert OpenClaw skill: {e}");
@@ -3517,6 +3568,86 @@ fn cmd_skill_install(source: &str) {
             "Installed skill: {} v{}",
             manifest.skill.name, manifest.skill.version
         );
+        notify_daemon_skill_reload();
+    } else if source.starts_with("https://")
+        || source.starts_with("http://")
+        || source.starts_with("git@")
+    {
+        // Git URL install — clone to temp dir then install from there
+        ui::step(&format!("Cloning skill from {source}..."));
+        let tmp_dir = tempfile::tempdir().unwrap_or_else(|e| {
+            eprintln!("Failed to create temp directory: {e}");
+            std::process::exit(1);
+        });
+        let clone_path = tmp_dir.path().join("skill");
+        let status = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                source,
+                clone_path.to_str().unwrap(),
+            ])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => {
+                eprintln!("Failed to clone repository: {source}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to run git: {e}");
+                ui::hint("Make sure git is installed and available on your PATH.");
+                std::process::exit(1);
+            }
+        }
+
+        // Reuse the local directory install logic on the cloned repo
+        let manifest_path = clone_path.join("skill.toml");
+        if !manifest_path.exists() {
+            if openfang_skills::openclaw_compat::detect_openclaw_skill(&clone_path) {
+                println!("Detected OpenClaw skill format. Converting...");
+                match openfang_skills::openclaw_compat::convert_openclaw_skill(&clone_path) {
+                    Ok(manifest) => {
+                        let dest = skills_dir.join(&manifest.skill.name);
+                        copy_dir_recursive(&clone_path, &dest);
+                        if let Err(e) = openfang_skills::openclaw_compat::write_openfang_manifest(
+                            &dest, &manifest,
+                        ) {
+                            eprintln!("Failed to write manifest: {e}");
+                            std::process::exit(1);
+                        }
+                        println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        notify_daemon_skill_reload();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to convert OpenClaw skill: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            eprintln!("No skill.toml found in cloned repository: {source}");
+            std::process::exit(1);
+        }
+
+        let toml_str = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+            eprintln!("Error reading skill.toml: {e}");
+            std::process::exit(1);
+        });
+        let manifest: openfang_skills::SkillManifest =
+            toml::from_str(&toml_str).unwrap_or_else(|e| {
+                eprintln!("Error parsing skill.toml: {e}");
+                std::process::exit(1);
+            });
+
+        let dest = skills_dir.join(&manifest.skill.name);
+        copy_dir_recursive(&clone_path, &dest);
+        println!(
+            "Installed skill: {} v{}",
+            manifest.skill.name, manifest.skill.version
+        );
+        notify_daemon_skill_reload();
     } else {
         // Remote install from FangHub
         println!("Installing {source} from FangHub...");
@@ -3525,12 +3656,34 @@ fn cmd_skill_install(source: &str) {
             openfang_skills::marketplace::MarketplaceConfig::default(),
         );
         match rt.block_on(client.install(source, &skills_dir)) {
-            Ok(version) => println!("Installed {source} {version}"),
+            Ok(version) => {
+                println!("Installed {source} {version}");
+                notify_daemon_skill_reload();
+            }
             Err(e) => {
                 eprintln!("Failed to install skill: {e}");
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Notify the running daemon to hot-reload its skill registry after a CLI install.
+///
+/// If the daemon is not running, this is a no-op with a hint to the user.
+fn notify_daemon_skill_reload() {
+    if let Some(base) = find_daemon() {
+        let client = daemon_client();
+        match client.post(format!("{base}/api/skills/reload")).send() {
+            Ok(resp) if resp.status().is_success() => {
+                ui::step("Daemon notified — skill registry reloaded.");
+            }
+            _ => {
+                ui::check_warn("Could not notify daemon. Restart with: openfang restart");
+            }
+        }
+    } else {
+        ui::hint("Start the daemon to make this skill available to agents: openfang start");
     }
 }
 
@@ -4231,23 +4384,37 @@ fn cmd_hand_active() {
     }
 }
 
-fn cmd_hand_activate(id: &str) {
+fn cmd_hand_activate(id: &str, name: Option<String>) {
     let base = require_daemon("hand activate");
     let client = daemon_client();
+    let request_body = match &name {
+        Some(n) => serde_json::json!({ "instance_name": n }).to_string(),
+        None => "{}".to_string(),
+    };
     let body = daemon_json(
         client
             .post(format!("{base}/api/hands/{id}/activate"))
             .header("content-type", "application/json")
-            .body("{}")
+            .body(request_body)
             .send(),
     );
     if body.get("instance_id").is_some() {
-        println!(
-            "Hand '{}' activated (instance: {}, agent: {})",
-            id,
-            body["instance_id"].as_str().unwrap_or("?"),
-            body["agent_name"].as_str().unwrap_or("?"),
-        );
+        if let Some(n) = &name {
+            println!(
+                "Hand '{}' activated (instance: {}, name: {}, agent: {})",
+                id,
+                body["instance_id"].as_str().unwrap_or("?"),
+                n,
+                body["agent_name"].as_str().unwrap_or("?"),
+            );
+        } else {
+            println!(
+                "Hand '{}' activated (instance: {}, agent: {})",
+                id,
+                body["instance_id"].as_str().unwrap_or("?"),
+                body["agent_name"].as_str().unwrap_or("?"),
+            );
+        }
     } else {
         eprintln!(
             "Failed to activate hand '{}': {}",
@@ -4467,6 +4634,9 @@ pub(crate) fn test_api_key(provider: &str, env_var: &str) -> bool {
             .get("https://openrouter.ai/api/v1/models")
             .bearer_auth(&key)
             .send(),
+        // Bedrock bearer tokens are only valid against bedrock-runtime, not the
+        // management plane. There is no cheap region-agnostic probe, so skip.
+        "bedrock" => return true,
         _ => return true, // unknown provider — skip test
     };
 
@@ -4815,6 +4985,27 @@ fn cmd_config_unset(key: &str) {
 }
 
 fn cmd_config_set_key(provider: &str) {
+    // GitHub Copilot uses OAuth device flow, not a simple API key paste.
+    if provider == "github-copilot" || provider == "copilot" {
+        let openfang_dir = cli_openfang_home();
+        let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+            ui::error(&format!("Failed to create async runtime: {e}"));
+            std::process::exit(1);
+        });
+        match rt.block_on(openfang_runtime::drivers::copilot::run_interactive_setup(&openfang_dir)) {
+            Ok(_) => {
+                ui::success("GitHub Copilot configured successfully");
+                ui::hint("Restart the daemon: openfang stop && openfang start");
+            }
+            Err(e) => {
+                ui::error(&format!("Copilot setup failed: {e}"));
+                ui::hint("Check your Client ID/Secret and try again");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let env_var = provider_to_env_var(provider);
 
     let key = prompt_input(&format!("  Paste your {provider} API key: "));
@@ -5858,6 +6049,28 @@ fn cmd_health(json: bool) {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_auth_hash_password() {
+    let password = prompt_input("Enter password: ");
+    if password.is_empty() {
+        ui::error("Empty password.");
+        std::process::exit(1);
+    }
+    let confirm = prompt_input("Confirm password: ");
+    if password != confirm {
+        ui::error("Passwords do not match.");
+        std::process::exit(1);
+    }
+    let hash = openfang_api::session_auth::hash_password(&password);
+    println!();
+    ui::success("Argon2id hash generated. Add this to your config.toml:");
+    println!();
+    println!("  [auth]");
+    println!("  enabled = true");
+    println!("  password_hash = \"{}\"", hash);
+    println!();
+    ui::hint("Restart the daemon after updating config.toml");
 }
 
 fn cmd_security_status(json: bool) {

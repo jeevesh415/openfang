@@ -42,34 +42,31 @@ function chatPage() {
     modelSwitching: false,
     _modelCache: null,
     _modelCacheTime: 0,
-    slashCommands: [
-      { cmd: '/help', desc: 'Show available commands' },
-      { cmd: '/agents', desc: 'Switch to Agents page' },
-      { cmd: '/new', desc: 'Reset session (clear history)' },
-      { cmd: '/compact', desc: 'Trigger LLM session compaction' },
-      { cmd: '/model', desc: 'Show or switch model (/model [name])' },
-      { cmd: '/stop', desc: 'Cancel current agent run' },
-      { cmd: '/usage', desc: 'Show session token usage & cost' },
-      { cmd: '/think', desc: 'Toggle extended thinking (/think [on|off|stream])' },
-      { cmd: '/context', desc: 'Show context window usage & pressure' },
-      { cmd: '/verbose', desc: 'Cycle tool detail level (/verbose [off|on|full])' },
-      { cmd: '/queue', desc: 'Check if agent is processing' },
-      { cmd: '/status', desc: 'Show system status' },
-      { cmd: '/clear', desc: 'Clear chat display' },
-      { cmd: '/exit', desc: 'Disconnect from agent' },
-      { cmd: '/budget', desc: 'Show spending limits and current costs' },
-      { cmd: '/peers', desc: 'Show OFP peer network status' },
-      { cmd: '/a2a', desc: 'List discovered external A2A agents' }
-    ],
+    slashCommands: [], // Loaded dynamically with i18n in init()
+    _slashCommandsLoaded: false,
     tokenCount: 0,
 
     // ── Tip Bar ──
     tipIndex: 0,
-    tips: ['Type / for commands', '/think on for reasoning', 'Ctrl+Shift+F for focus mode', 'Drag files to attach', '/model to switch models', '/context to check usage', '/verbose off to hide tool details'],
+    tips: [],
+    _tipsInitialized: false,
     tipTimer: null,
     get currentTip() {
       if (localStorage.getItem('of-tips-off') === 'true') return '';
-      return this.tips[this.tipIndex % this.tips.length];
+      if (!this._tipsInitialized) {
+        var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
+        this.tips = [
+          t('tips.commands'),
+          t('tips.think'),
+          t('tips.focus'),
+          'Drag files to attach',
+          '/model to switch models',
+          '/context to check usage',
+          '/verbose off to hide tool details'
+        ];
+        this._tipsInitialized = true;
+      }
+      return this.tips[this.tipIndex % this.tips.length] || '';
     },
     dismissTips: function() { localStorage.setItem('of-tips-off', 'true'); },
     startTipCycle: function() {
@@ -136,6 +133,9 @@ function chatPage() {
 
     init() {
       var self = this;
+
+      // Initialize slash commands with i18n
+      this.initSlashCommands();
 
       // Start tip cycle
       this.startTipCycle();
@@ -264,17 +264,44 @@ function chatPage() {
       if (model.id === this.currentAgent.model_name) { this.showModelSwitcher = false; return; }
       var self = this;
       this.modelSwitching = true;
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function(resp) {
         // Use server-resolved model/provider to stay in sync (fixes #387/#466)
         self.currentAgent.model_name = (resp && resp.model) || model.id;
         self.currentAgent.model_provider = (resp && resp.provider) || model.provider;
-        OpenFangToast.success('Switched to ' + (model.display_name || model.id));
+        OpenFangToast.success(t('chat.model_switched') + ' ' + (model.display_name || model.id));
         self.showModelSwitcher = false;
         self.modelSwitching = false;
       }).catch(function(e) {
-        OpenFangToast.error('Switch failed: ' + e.message);
+        OpenFangToast.error(t('chat.model_switch_failed') + ': ' + e.message);
         self.modelSwitching = false;
       });
+    },
+
+    // Initialize slash commands with i18n translations
+    initSlashCommands: function() {
+      if (this._slashCommandsLoaded) return;
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
+      this.slashCommands = [
+        { cmd: '/help', desc: t('chat.slash.help') },
+        { cmd: '/agents', desc: t('chat.slash.agents') },
+        { cmd: '/new', desc: t('chat.slash.new') },
+        { cmd: '/compact', desc: t('chat.slash.compact') },
+        { cmd: '/model', desc: t('chat.slash.model') },
+        { cmd: '/stop', desc: t('chat.slash.stop') },
+        { cmd: '/usage', desc: t('chat.slash.usage') },
+        { cmd: '/think', desc: t('chat.slash.think') },
+        { cmd: '/context', desc: t('chat.slash.context') },
+        { cmd: '/verbose', desc: t('chat.slash.verbose') },
+        { cmd: '/queue', desc: t('chat.slash.queue') },
+        { cmd: '/status', desc: t('chat.slash.status') },
+        { cmd: '/clear', desc: t('chat.slash.clear') },
+        { cmd: '/exit', desc: t('chat.slash.exit') },
+        { cmd: '/budget', desc: t('chat.slash.budget') },
+        { cmd: '/peers', desc: t('chat.slash.peers') },
+        { cmd: '/a2a', desc: t('chat.slash.a2a') }
+      ];
+      this._slashCommandsLoaded = true;
     },
 
     // Fetch dynamic slash commands from server
@@ -486,21 +513,13 @@ function chatPage() {
       this.currentAgent = agent;
       this.messages = [];
       this.connectWs(agent.id);
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       // Show welcome tips on first use
       if (!localStorage.getItem('of-chat-tips-seen')) {
-        var localMsgId = 0;
         this.messages.push({
-          id: ++localMsgId,
+          id: ++msgId,
           role: 'system',
-          text: '**Welcome to OpenFang Chat!**\n\n' +
-            '- Type `/` to see available commands\n' +
-            '- `/help` shows all commands\n' +
-            '- `/think on` enables extended reasoning\n' +
-            '- `/context` shows context window usage\n' +
-            '- `/verbose off` hides tool details\n' +
-            '- `Ctrl+Shift+F` toggles focus mode\n' +
-            '- Drag & drop files to attach them\n' +
-            '- `Ctrl+/` opens the command palette',
+          text: t('chat.welcome_message'),
           meta: '',
           tools: []
         });
@@ -519,7 +538,14 @@ function chatPage() {
       try {
         var data = await OpenFangAPI.get('/api/agents/' + agentId + '/session');
         if (data.messages && data.messages.length) {
-          self.messages = data.messages.map(function(m) {
+          // Defense-in-depth (#935): never render system-role messages in the
+          // conversation history view, even if the backend somehow returns
+          // one. The server already filters these out by default, but we
+          // guard here too so a regression cannot leak the system prompt.
+          var visible = data.messages.filter(function(m) {
+            return m && m.role !== 'System' && m.role !== 'system';
+          });
+          self.messages = visible.map(function(m) {
             var role = m.role === 'User' ? 'user' : (m.role === 'System' ? 'system' : 'agent');
             var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
             // Sanitize any raw function-call text from history
@@ -557,7 +583,8 @@ function chatPage() {
     // Multi-session: create a new session
     async createSession() {
       if (!this.currentAgent) return;
-      var label = prompt('Session name (optional):');
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
+      var label = prompt(t('chat.session_name_prompt'));
       if (label === null) return; // cancelled
       try {
         await OpenFangAPI.post('/api/agents/' + this.currentAgent.id + '/sessions', {
@@ -567,9 +594,9 @@ function chatPage() {
         await this.loadSession(this.currentAgent.id);
         this.messages = [];
         this.scrollToBottom();
-        if (typeof OpenFangToast !== 'undefined') OpenFangToast.success('New session created');
+        if (typeof OpenFangToast !== 'undefined') OpenFangToast.success(t('chat.session_created'));
       } catch(e) {
-        if (typeof OpenFangToast !== 'undefined') OpenFangToast.error('Failed to create session');
+        if (typeof OpenFangToast !== 'undefined') OpenFangToast.error(t('chat.session_create_failed'));
       }
     },
 
@@ -622,8 +649,12 @@ function chatPage() {
             this.scrollToBottom();
             this._resetTypingTimeout();
           } else if (data.level) {
-            var lastThink = this.messages[this.messages.length - 1];
-            if (lastThink && lastThink.thinking) lastThink.text = 'Thinking (' + data.level + ')...';
+            var thinkIdx = this.messages.length - 1;
+            var lastThink = thinkIdx >= 0 ? this.messages[thinkIdx] : null;
+            if (lastThink && lastThink.thinking) {
+              lastThink.text = 'Thinking (' + data.level + ')...';
+              this.messages.splice(thinkIdx, 1, lastThink);
+            }
           }
           break;
 
@@ -636,9 +667,11 @@ function chatPage() {
             }
             this._resetTypingTimeout();
           } else if (data.state === 'tool') {
-            var typingMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
+            var toolTypIdx = this.messages.length - 1;
+            var typingMsg = toolTypIdx >= 0 ? this.messages[toolTypIdx] : null;
             if (typingMsg && (typingMsg.thinking || typingMsg.streaming)) {
               typingMsg.text = 'Using ' + (data.tool || 'tool') + '...';
+              this.messages.splice(toolTypIdx, 1, typingMsg);
             }
             this._resetTypingTimeout();
           } else if (data.state === 'stop') {
@@ -648,7 +681,8 @@ function chatPage() {
 
         case 'phase':
           // Show tool/phase progress so the user sees the agent is working
-          var phaseMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
+          var phaseIdx = this.messages.length - 1;
+          var phaseMsg = phaseIdx >= 0 ? this.messages[phaseIdx] : null;
           if (phaseMsg && (phaseMsg.thinking || phaseMsg.streaming)) {
             // Skip phases that have no user-meaningful display text — "streaming"
             // and "done" are lifecycle signals, not status to show in the chat bubble.
@@ -664,6 +698,7 @@ function chatPage() {
               if (!phaseMsg._reasoning) phaseMsg._reasoning = '';
               phaseMsg._reasoning += (data.detail || '') + '\n';
               phaseMsg.text = '<details><summary>Reasoning...</summary>\n\n' + phaseMsg._reasoning + '</details>';
+              this.messages.splice(phaseIdx, 1, phaseMsg);
             } else if (phaseMsg.thinking) {
               // Only update text on messages still in thinking state (not yet
               // receiving streamed content) to avoid overwriting accumulated text.
@@ -676,13 +711,15 @@ function chatPage() {
                 phaseDetail = data.detail || 'Working...';
               }
               phaseMsg.text = phaseDetail;
+              this.messages.splice(phaseIdx, 1, phaseMsg);
             }
           }
           this.scrollToBottom();
           break;
 
         case 'text_delta':
-          var last = this.messages.length ? this.messages[this.messages.length - 1] : null;
+          var lastIdx = this.messages.length - 1;
+          var last = lastIdx >= 0 ? this.messages[lastIdx] : null;
           if (last && last.streaming) {
             if (last.thinking) { last.text = ''; last.thinking = false; }
             // If we already detected a text-based tool call, skip further text
@@ -711,6 +748,10 @@ function chatPage() {
               }
             }
             this.tokenCount = Math.round(last.text.length / 4);
+            // Force Alpine reactivity: splice-in-place so x-for re-renders
+            // this item. Direct property mutation on array elements may not
+            // trigger DOM updates from async WebSocket callbacks.
+            this.messages.splice(lastIdx, 1, last);
           } else {
             this.messages.push({ id: ++msgId, role: 'agent', text: data.content, meta: '', streaming: true, tools: [] });
           }
@@ -718,17 +759,20 @@ function chatPage() {
           break;
 
         case 'tool_start':
-          var lastMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
+          var tsIdx = this.messages.length - 1;
+          var lastMsg = tsIdx >= 0 ? this.messages[tsIdx] : null;
           if (lastMsg && lastMsg.streaming) {
             if (!lastMsg.tools) lastMsg.tools = [];
             lastMsg.tools.push({ id: data.tool + '-' + Date.now(), name: data.tool, running: true, expanded: true, input: '', result: '', is_error: false });
+            this.messages.splice(tsIdx, 1, lastMsg);
           }
           this.scrollToBottom();
           break;
 
         case 'tool_end':
           // Tool call parsed by LLM — update tool card with input params
-          var lastMsg2 = this.messages.length ? this.messages[this.messages.length - 1] : null;
+          var teIdx = this.messages.length - 1;
+          var lastMsg2 = teIdx >= 0 ? this.messages[teIdx] : null;
           if (lastMsg2 && lastMsg2.tools) {
             for (var ti = lastMsg2.tools.length - 1; ti >= 0; ti--) {
               if (lastMsg2.tools[ti].name === data.tool && lastMsg2.tools[ti].running) {
@@ -736,12 +780,14 @@ function chatPage() {
                 break;
               }
             }
+            this.messages.splice(teIdx, 1, lastMsg2);
           }
           break;
 
         case 'tool_result':
           // Tool execution completed — update tool card with result
-          var lastMsg3 = this.messages.length ? this.messages[this.messages.length - 1] : null;
+          var trIdx = this.messages.length - 1;
+          var lastMsg3 = trIdx >= 0 ? this.messages[trIdx] : null;
           if (lastMsg3 && lastMsg3.tools) {
             for (var ri = lastMsg3.tools.length - 1; ri >= 0; ri--) {
               if (lastMsg3.tools[ri].name === data.tool && lastMsg3.tools[ri].running) {
@@ -770,6 +816,7 @@ function chatPage() {
                 break;
               }
             }
+            this.messages.splice(trIdx, 1, lastMsg3);
           }
           this.scrollToBottom();
           break;
@@ -986,8 +1033,9 @@ function chatPage() {
       }
 
       // HTTP fallback
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       if (!OpenFangAPI.isWsConnected()) {
-        OpenFangToast.info('Using HTTP mode (no streaming)');
+        OpenFangToast.info(t('chat.using_http_mode'));
       }
       this.messages.push({ id: ++msgId, role: 'agent', text: '', meta: '', thinking: true, tools: [], ts: Date.now() });
       this.scrollToBottom();
@@ -1030,18 +1078,19 @@ function chatPage() {
     killAgent() {
       if (!this.currentAgent) return;
       var self = this;
+      var t = typeof window.t === 'function' ? window.t : function(s) { return s; };
       var name = this.currentAgent.name;
-      OpenFangToast.confirm('Stop Agent', 'Stop agent "' + name + '"? The agent will be shut down.', async function() {
+      OpenFangToast.confirm(t('chat.stop_agent_title'), t('chat.stop_agent_confirm') + ' "' + name + '"?', async function() {
         try {
           await OpenFangAPI.del('/api/agents/' + self.currentAgent.id);
           OpenFangAPI.wsDisconnect();
           self._wsAgent = null;
           self.currentAgent = null;
           self.messages = [];
-          OpenFangToast.success('Agent "' + name + '" stopped');
+          OpenFangToast.success(t('chat.agent_stopped') + ' "' + name + '"');
           Alpine.store('app').refreshAgents();
         } catch(e) {
-          OpenFangToast.error('Failed to stop agent: ' + e.message);
+          OpenFangToast.error(t('chat.stop_agent_failed') + ': ' + e.message);
         }
       });
     },
@@ -1125,6 +1174,9 @@ function chatPage() {
 
     formatToolJson: function(text) {
       if (!text) return '';
+      if (typeof text === 'object') {
+        return JSON.stringify(text, null, 2);
+      }
       try { return JSON.stringify(JSON.parse(text), null, 2); }
       catch(e) { return text; }
     },
